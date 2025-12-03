@@ -95,3 +95,125 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import pandas as pd
+import numpy as np
+import os
+import gzip
+import pickle
+import json
+
+from sklearn.model_selection import GridSearchCV
+from sklearn.pipeline import Pipeline
+from sklearn.compose import ColumnTransformer
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.decomposition import PCA
+from sklearn.svm import SVC
+from sklearn.metrics import precision_score, recall_score, f1_score, balanced_accuracy_score, confusion_matrix
+
+def preprocess_data(df):
+    df = df.copy()
+    df.rename(columns={'default payment next month': 'default'}, inplace=True)
+    df.drop(columns=['ID'], inplace=True)
+    df['EDUCATION'].replace(0, np.nan, inplace=True)
+    df['MARRIAGE'].replace(0, np.nan, inplace=True)
+    df.dropna(inplace=True)
+    df.loc[df['EDUCATION'] > 4, 'EDUCATION'] = 4
+    return df
+
+def split_features_labels(df, target):
+    X = df.drop(columns=[target])
+    y = df[target]
+    return X, y
+
+def build_model_pipeline(X):
+    categorical = ['SEX', 'EDUCATION', 'MARRIAGE']
+    numerical = [col for col in X.columns if col not in categorical]
+
+    transformer = ColumnTransformer(
+        transformers=[
+            ('cat', OneHotEncoder(handle_unknown='ignore'), categorical),
+            ('num', StandardScaler(), numerical)
+        ]
+    )
+
+    pipeline = Pipeline([
+        ('transform', transformer),
+        ('pca', PCA()),
+        ('select', SelectKBest(score_func=f_classif)),
+        ('classifier', SVC())
+    ])
+
+    return pipeline
+
+def tune_hyperparameters(pipeline, X, y):
+    param_grid = {
+        'pca__n_components': [21],
+        'select__k': [12],
+        'classifier__C': [0.8],
+        'classifier__kernel': ['rbf'],
+        'classifier__gamma': [0.1]
+    }
+    search = GridSearchCV(pipeline, param_grid, scoring='balanced_accuracy', cv=10, n_jobs=-1)
+    search.fit(X, y)
+    return search
+
+def export_model(model, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with gzip.open(path, 'wb') as f:
+        pickle.dump(model, f)
+
+def evaluate_model(model, X_train, y_train, X_test, y_test):
+    metrics_list = []
+    matrices_list = []
+    for name, X, y in [('train', X_train, y_train), ('test', X_test, y_test)]:
+        y_pred = model.predict(X)
+        metrics = {
+            'type': 'metrics',
+            'dataset': name,
+            'precision': round(precision_score(y, y_pred), 3),
+            'balanced_accuracy': round(balanced_accuracy_score(y, y_pred), 3),
+            'recall': round(recall_score(y, y_pred), 3),
+            'f1_score': round(f1_score(y, y_pred), 3)
+        }
+        cm = confusion_matrix(y, y_pred)
+        matrix = {
+            'type': 'cm_matrix',
+            'dataset': name,
+            'true_0': {"predicted_0": int(cm[0, 0]), "predicted_1": int(cm[0, 1])},
+            'true_1': {"predicted_0": int(cm[1, 0]), "predicted_1": int(cm[1, 1])}
+        }
+        metrics_list.append(metrics)
+        matrices_list.append(matrix)
+    return metrics_list[:1] + metrics_list[1:] + matrices_list[:1] + matrices_list[1:]
+
+def save_metrics(results, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    pd.DataFrame(results).to_json(path, orient='records', lines=True)
+
+def main():
+    train_zip = 'files/input/train_data.csv.zip'
+    test_zip = 'files/input/test_data.csv.zip'
+    model_path = 'files/models/model.pkl.gz'
+    metrics_path = 'files/output/metrics.json'
+
+    train_df = pd.read_csv(train_zip, compression='zip')
+    test_df = pd.read_csv(test_zip, compression='zip')
+
+    train_df = preprocess_data(train_df)
+    test_df = preprocess_data(test_df)
+
+    X_train, y_train = split_features_labels(train_df, 'default')
+    X_test, y_test = split_features_labels(test_df, 'default')
+
+    pipeline = build_model_pipeline(X_train)
+    model = tune_hyperparameters(pipeline, X_train, y_train)
+
+    export_model(model, model_path)
+
+    results = evaluate_model(model, X_train, y_train, X_test, y_test)
+    save_metrics(results, metrics_path)
+
+if __name__ == '__main__':
+    main()
